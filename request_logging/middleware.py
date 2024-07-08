@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import time
@@ -23,7 +24,7 @@ DEFAULT_SENSITIVE_HEADERS = [
 ] if IS_DJANGO_VERSION_GTE_3_2_0 else [
     "HTTP_AUTHORIZATION", "HTTP_PROXY_AUTHORIZATION"
 ]
-DEFAULT_SENSITIVE_VIEWS = []
+DEFAULT_SENSITIVE_VIEWS = {}
 DEFAULT_LOG_PROCESSING_TIME = False
 SETTING_NAMES = {
     "log_level": "REQUEST_LOGGING_DATA_LOG_LEVEL",
@@ -88,6 +89,11 @@ class LoggingMiddleware(object):
             raise ValueError(
                 "{} should be list. {} is not list.".format(SETTING_NAMES["sensitive_headers"], self.sensitive_headers)
             )
+        
+        if not isinstance(self.sensitive_views, dict):
+            raise ValueError(
+                "{} should be a dictionary. {} is not dictionary.".format(SETTING_NAMES["sensitive_views"], self.sensitive_views)
+            )
 
         for log_attr in ("log_level", "http_4xx_log_level"):
             level = getattr(self, log_attr)
@@ -139,10 +145,16 @@ class LoggingMiddleware(object):
         return response
 
     def process_request(self, request, response=None):
-        skip_logging, because = self._should_log_route(request)
+        skip_logging, because = self._should_log_route(request)      
         if skip_logging:
-            if because is not None:
-                return self._skip_logging_request(request, because)
+            if isinstance(because, list) and len(because) != 0:
+                self.cached_request_body, masked = self._mask_sensitive_data(self.cached_request_body, because)
+                if not masked:
+                    return self._skip_logging_request(request, NO_LOGGING_MSG)
+                else:
+                    return self._log_request(request, response)
+            else:
+                return self._skip_logging_request(request, NO_LOGGING_MSG)
         else:
             return self._log_request(request, response)
 
@@ -152,9 +164,13 @@ class LoggingMiddleware(object):
         else:
             full_path = None
 
-        if full_path is not None and full_path in self.sensitive_views:
-            no_logging = True
-            no_logging_msg = NO_LOGGING_MSG
+        if full_path and self.sensitive_views.get(full_path, False): 
+                keywords = self.sensitive_views.get(full_path) 
+                if keywords:                  
+                    return full_path, keywords
+                else:
+                    no_logging = True
+                    no_logging_msg = NO_LOGGING_MSG
         else:
             no_logging = getattr(func, NO_LOGGING_ATTR, False)
             no_logging_msg = getattr(func, NO_LOGGING_MSG_ATTR, None)
@@ -249,8 +265,8 @@ class LoggingMiddleware(object):
                     logging.INFO, resp_log, {"args": {}, "kwargs": {"extra": {"no_logging": because}}}
                 )
             return response
+        
         logging_context = self._get_logging_context(request, response)
-
         if response.status_code in range(400, 500):
             if self.http_4xx_log_level == DEFAULT_HTTP_4XX_LOG_LEVEL:
                 # default, log as per 5xx
@@ -322,3 +338,18 @@ class LoggingMiddleware(object):
 
     def _chunked_to_max(self, msg):
         return msg[0:self.max_body_length]
+    
+    def _mask_sensitive_data(self, body, keywords):
+        """
+        Masks sensitive data in the request body.
+        """
+        masked = False
+        try:
+            body_dict = json.loads(body)
+            for key in keywords:
+                if key in body_dict:
+                    body_dict[key] = "*****"
+                    masked = True
+            return json.dumps(body_dict).encode('utf-8'), masked
+        except json.JSONDecodeError:
+            return body, masked  # If the body is not JSON, return it as is
